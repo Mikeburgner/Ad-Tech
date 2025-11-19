@@ -1,0 +1,56 @@
+
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>Blob‑Powered Ad Tag Tester (Non‑Sandboxed)</title>
+<style>
+body { font-family: Arial, sans-serif; padding: 20px; }
+textarea { width: 100%; height: 150px; }
+button { padding: 10px 20px; margin-top: 10px; cursor: pointer; }
+iframe { width: 100%; height: 700px; border: 1px solid #ccc; margin-top:20px; }
+</style>
+</head>
+<body>
+
+<h2>Blob‑Powered Ad Tag Tester</h2>
+<p>
+This version executes <strong>all</strong> ad tags (scripts, redirects, VAST chains, JS loaders) without sandboxing.
+<br>It uses a <strong>blob iframe</strong> which Chrome treats as a real page origin → everything fires normally.
+</p>
+
+<textarea id="tagInput" placeholder="Paste one or more ad tags here..."></textarea>
+<br>
+<button onclick="runTags()">Run Tags</button>
+
+<iframe id="testFrame"></iframe>
+
+<script>
+function runTags(){
+    const raw = document.getElementById('tagInput').value.trim();
+    if(!raw){
+        alert("Please paste one or more ad tags.");
+        return;
+    }
+
+    const tags = raw.split(/\n{2,}/).map(t => t.trim()).filter(t => t.length > 0);
+
+    let html = "<!DOCTYPE html><html><body>";
+
+    tags.forEach(tag => {
+        html += "\n<!-- Injected tag -->\n" + tag + "\n";
+    });
+
+    html += "</body></html>";
+
+    // Blob iframe prevents sandboxing restrictions
+    const blob = new Blob([html], { type: "text/html" });
+    const blobURL = URL.createObjectURL(blob);
+
+    const iframe = document.getElementById("testFrame");
+    iframe.src = blobURL;
+}
+</script>
+
+</body>
+</html>
