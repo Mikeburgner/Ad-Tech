@@ -1,0 +1,495 @@
+# ================================================================
+# HAR + VAST Scanner with Placement-Centric ID Matching
+# - master_scan_file.xlsx:
+#     * lookups    (col: string)
+#     * video      (col: vast_url)
+#     * placements (col: placement_name + pid/sid/... optional)
+# - HAR file is separate: HAR_PATH
+# - Outputs:
+#     * scan_output_har.xlsx
+#     * scan_output_vast.xlsx
+# ================================================================
+import base64
+import os
+import json
+import pandas as pd
+import xml.etree.ElementTree as ET
+import requests
+from urllib.parse import unquote_plus, quote, quote_plus
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# ================================================================
+# CONFIG
+# ================================================================
+MASTER_FILE     = "search_file_FanaticsOC.xlsx"
+LOOKUP_SHEET    = "lookups"
+VAST_SHEET      = "video"
+PLACEMENT_SHEET = "placements"
+
+HAR_PATH        = "bw_coop.har"           # separate HAR file
+OUTPUT_HAR      = "scan_output_har_bw.xlsx"
+OUTPUT_VAST     = "scan_output_vast.xlsx"
+
+# ID columns we consider for placements
+ID_COLS = ["pid","sid","placement_id","cid","creative_id","adid","cmp","tagid"]
+
+# ================================================================
+# LOAD WORKBOOK SHEETS
+# ================================================================
+lookups_df    = pd.read_excel(MASTER_FILE, sheet_name=LOOKUP_SHEET)
+video_df      = pd.read_excel(MASTER_FILE, sheet_name=VAST_SHEET)
+placements_df = pd.read_excel(MASTER_FILE, sheet_name=PLACEMENT_SHEET)
+
+lookups_df.columns    = lookups_df.columns.str.strip().str.lower()
+video_df.columns      = video_df.columns.str.strip().str.lower()
+placements_df.columns = placements_df.columns.str.strip().str.lower()
+
+if "string" not in lookups_df.columns:
+    raise ValueError("Sheet 'lookups' must contain column 'string'")
+if "vast_url" not in video_df.columns:
+    raise ValueError("Sheet 'video' must contain column 'vast_url'")
+if "placement_name" not in placements_df.columns:
+    raise ValueError("Sheet 'placements' must contain column 'placement_name'")
+
+# active ID columns actually present
+active_id_cols = [c for c in ID_COLS if c in placements_df.columns]
+if not active_id_cols:
+    print("[WARN] No ID columns found in placements; ID matching will be empty.")
+
+lookup_strings_ordered = [
+    str(s).strip().lower() for s in lookups_df["string"].tolist()
+]
+
+print(f"[INIT] Lookups: {len(lookup_strings_ordered)} | VAST URLs: {len(video_df)} | Placements: {len(placements_df)}")
+print(f"[INIT] Active ID cols: {active_id_cols}")
+
+# which ID is "primary" (PID first, else first active)
+PRIMARY_ID_COL = "pid" if "pid" in active_id_cols else (active_id_cols[0] if active_id_cols else None)
+# ================================================================
+# COMMON HELPERS
+# ================================================================
+def needle_variants(raw: str):
+    """Literal + encoded variants for matching."""
+    n = (raw or "").strip().lower()
+    if not n:
+        return []
+    return list({n, quote(n, safe="").lower(), quote_plus(n).lower()})
+
+def make_snippet(text, idx, needle, ctx_before=120, ctx_after=200):
+    if idx < 0:
+        return ""
+    start = max(0, idx - ctx_before)
+    end   = min(len(text), idx + len(needle) + ctx_after)
+    return text[start:end]
+
+def make_xmlish_snippet(text, idx, needle, max_expand=400):
+    """Try to expand to tag-like boundaries; else fallback to generic snippet."""
+    if idx < 0:
+        return ""
+    left  = text.rfind("<", 0, idx)
+    right = text.find(">", idx + len(needle))
+    if left != -1 and right != -1 and (right - left) <= max_expand:
+        return text[left:right+1]
+    return make_snippet(text, idx, needle)
+
+def build_missing_df_by_placement_and_lookup(wide_matrix):
+    """
+    wide_matrix[(placement_index, lookup_string)] = bool found
+    Returns placement-centric missing rows.
+    """
+    rows = []
+    for (pi, lookup), found in wide_matrix.items():
+        if not found:
+            p = placements_df.loc[pi]
+            pid_val = str(p.get(PRIMARY_ID_COL, "")).strip() if PRIMARY_ID_COL else ""
+            rows.append({
+                "Placement Name": p["placement_name"],
+                "PID": pid_val,
+                "Lookup String": lookup
+            })
+    return pd.DataFrame(rows)
+
+def scan_har_raw(har_path, lookup_df):
+    import base64
+    
+    with open(har_path, "r", encoding="utf-8") as f:
+        har = json.load(f)
+
+    entries = har.get("log", {}).get("entries", [])
+    print(f"[HAR] Loaded {len(entries)} entries from {har_path}")
+
+    def extract_response_url(e):
+        """
+        Determine the correct 'response URL':
+        - If 302 and Location header exists → use redirect Location
+        - Else → request URL
+        """
+        req = e.get("request", {})
+        res = e.get("response", {})
+
+        status = res.get("status", 0)
+        headers = {h.get("name","").lower(): h.get("value","") for h in res.get("headers", [])}
+
+        if status == 302 and "location" in headers:
+            return headers["location"]
+        return req.get("url", "")
+
+    def entry_text(e):
+        parts = []
+        req = e.get("request", {})
+        res = e.get("response", {})
+
+        # ---------- REQUEST ----------
+        url_raw = req.get("url", "") or ""
+        parts.append(url_raw)
+        parts.append(unquote_plus(url_raw))
+
+        # Method
+        method = req.get("method", "")
+        if method:
+            parts.append(method)
+
+        # Request headers
+        for h in req.get("headers", []):
+            v = h.get("value", "") or ""
+            parts.append(v)
+            parts.append(unquote_plus(v))
+
+        # Query params
+        for q in req.get("queryString", []):
+            val = q.get("value", "") or ""
+            parts.append(val)
+            parts.append(unquote_plus(val))
+
+        # Post body
+        body = req.get("postData", {}).get("text", "") or ""
+        if body:
+            parts.append(body)
+            parts.append(unquote_plus(body))
+
+        # ---------- RESPONSE ----------
+        status = res.get("status", 0)
+        status_text = f"STATUS:{status}"
+        parts.append(status_text)
+
+        # Response headers
+        for h in res.get("headers", []):
+            v = h.get("value", "") or ""
+            parts.append(v)
+            try:
+                parts.append(unquote_plus(v))
+            except:
+                pass
+
+        # Response body (decoded if base64)
+        content = res.get("content", {})
+        ctext = content.get("text", "") or ""
+        if ctext:
+            encoding = (content.get("encoding") or "").lower()
+            if encoding == "base64":
+                try:
+                    decoded_bytes = base64.b64decode(ctext)
+                    decoded_text = decoded_bytes.decode("utf-8", errors="ignore")
+                    parts.append(decoded_text)
+                except:
+                    parts.append(ctext)
+            else:
+                parts.append(ctext)
+
+        return (
+            "\n".join([p for p in parts if p]).lower(),
+            url_raw,
+            extract_response_url(e),
+            status
+        )
+
+    entry_texts = []
+    req_urls    = []
+    res_urls    = []
+    statuses    = []
+
+    for e in entries:
+        t, req_u, res_u, st = entry_text(e)
+        entry_texts.append(t)
+        req_urls.append(req_u)
+        res_urls.append(res_u)
+        statuses.append(st)
+
+    matches = []
+
+    for _, row in lookup_df.iterrows():
+        base = str(row["string"]).strip()
+        if not base:
+            continue
+
+        variants = needle_variants(base)
+
+        for i, text in enumerate(entry_texts):
+            hit_variant = None
+            hit_idx = -1
+            for v in variants:
+                idx = text.find(v)
+                if idx != -1:
+                    hit_variant = v
+                    hit_idx = idx
+                    break
+
+            if hit_variant is not None:
+                snippet = make_snippet(text, hit_idx, hit_variant)
+
+                matches.append({
+                        "lookup_string": base.lower(),
+                        "matched_variant": hit_variant,
+                        "matched_snippet": snippet,
+                        "request_url": req_urls[i],
+                        "response_url": res_urls[i],
+                        "status_code": statuses[i],
+                        "status_ok": "YES" if statuses[i] in (200,302) else "NO",
+                        "mode": "HAR",
+                        "source_file": HAR_PATH
+                    })
+
+    return pd.DataFrame(matches)
+
+# ================================================================
+# VAST SCANNER (RAW MATCHES, NO PLACEMENT YET)
+# ================================================================
+def fetch_vast(url, timeout=10):
+    if url.lower().startswith("http"):
+        try:
+            r = requests.get(url, timeout=timeout)
+            r.raise_for_status()
+            return r.text, "fetched_ok"
+        except Exception as e:
+            return "", f"fetch_failed: {e}"
+    else:
+        try:
+            with open(url, "r", encoding="utf-8") as f:
+                return f.read(), "local_ok"
+        except Exception as e:
+            return "", f"local_failed: {e}"
+
+def xml_to_text(xml_string):
+    try:
+        root = ET.fromstring(xml_string)
+    except Exception as e:
+        return "", f"xml_parse_failed: {e}"
+
+    parts = []
+    def walk(node):
+        if node.tag:
+            parts.append(node.tag)
+        if node.text and node.text.strip():
+            parts.append(node.text.strip())
+        for k, v in node.attrib.items():
+            parts.append(f"{k}={v}")
+        for child in node:
+            walk(child)
+        if node.tail and node.tail.strip():
+            parts.append(node.tail.strip())
+
+    walk(root)
+    return "\n".join(parts).lower(), "xml_parse_ok"
+
+def scan_vast_raw(video_df, lookup_df):
+    urls = video_df["vast_url"].dropna().astype(str).tolist()
+    print("[VAST] Total URLs:", len(urls))
+
+    fetched = {}
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        fut = {ex.submit(fetch_vast, u): u for u in urls}
+        for f in as_completed(fut):
+            u = fut[f]
+            fetched[u] = f.result()
+
+    matches = []
+    status_rows = []
+
+    for u in urls:
+        xml_text, fetch_status = fetched.get(u, ("", "not_fetched"))
+        if not xml_text:
+            status_rows.append({
+                "Source File": u,
+                "Status": "NO_XML",
+                "Fetch Status": fetch_status,
+                "XML Status": ""
+            })
+            continue
+
+        vast_text, xml_status = xml_to_text(xml_text)
+        status_rows.append({
+            "Source File": u,
+            "Status": "SCANNED",
+            "Fetch Status": fetch_status,
+            "XML Status": xml_status
+        })
+
+        for _, row in lookup_df.iterrows():
+            base = str(row["string"]).strip()
+            if not base:
+                continue
+            variants = needle_variants(base)
+
+            hit_variant = None
+            hit_idx = -1
+            for v in variants:
+                idx = vast_text.find(v)
+                if idx != -1:
+                    hit_variant = v
+                    hit_idx = idx
+                    break
+
+            if hit_variant is not None:
+                snippet = make_xmlish_snippet(vast_text, hit_idx, hit_variant)
+                matches.append({
+                    "lookup_string": base.lower(),
+                    "matched_variant": hit_variant,
+                    "matched_snippet": snippet,
+                    # Align with HAR fields:
+                    "request_url": "",          # no request URL concept here
+                    "response_url": u,          # treat the VAST URL as response_url
+                    "status_code": "",          # we don't have HTTP code here
+                    "status_ok": "",            # leave blank
+                    "mode": "VAST",
+                    "source_file": u
+                })
+
+    return pd.DataFrame(matches), pd.DataFrame(status_rows)
+
+
+# ================================================================
+# PLACEMENT-CENTRIC BINDING + WIDE/MISSING CONSTRUCTION
+# ================================================================
+def build_placement_outputs(matches_raw: pd.DataFrame, mode: str):
+    """
+    Take raw matches (HAR or VAST) and:
+      - bind per-placement using ID columns
+      - build:
+          * Matches (placement-level rows)
+          * Missing (placement × lookup not found)
+          * Wide (placement × lookup matrix)
+    """
+    # placement × lookup → bool
+    wide_matrix = {
+        (pi, ls): False
+        for pi in placements_df.index
+        for ls in lookup_strings_ordered
+    }
+
+    matches_rows = []
+
+    if not matches_raw.empty:
+        matches_raw = matches_raw.copy()
+        matches_raw["lookup_string"]   = matches_raw["lookup_string"].str.lower()
+        matches_raw["matched_snippet"] = matches_raw["matched_snippet"].astype(str)
+        matches_raw["matched_variant"] = matches_raw["matched_variant"].astype(str)
+        matches_raw["request_url"]     = matches_raw.get("request_url", "").astype(str)
+        matches_raw["response_url"]    = matches_raw.get("response_url", "").astype(str)
+        matches_raw["status_code"]     = matches_raw.get("status_code", "")
+        matches_raw["source_file"]     = matches_raw.get("source_file", "").astype(str)
+
+    for pi, p in placements_df.iterrows():
+        placement_name = str(p["placement_name"])
+        pid_val = str(p.get(PRIMARY_ID_COL, "")).strip() if PRIMARY_ID_COL else ""
+
+        for ls in lookup_strings_ordered:
+            if matches_raw.empty:
+                continue
+
+            subset = matches_raw[matches_raw["lookup_string"] == ls]
+            if subset.empty:
+                continue
+
+            # For each ID category, only match on that specific ID
+            for id_col in active_id_cols:
+                id_val = str(p.get(id_col, "")).strip().lower()
+                if not id_val:
+                    continue
+
+                for _, m in subset.iterrows():
+                    search_space = " ".join([
+                        m["matched_snippet"].lower(),
+                        m["matched_variant"].lower(),
+                        m["request_url"].lower(),
+                        m["response_url"].lower(),
+                        m["source_file"].lower(),
+                    ])
+
+                    if id_val and id_val in search_space:
+                        wide_matrix[(pi, ls)] = True
+
+                        matches_rows.append({
+                            "Placement Name": placement_name,
+                            "PID": pid_val,
+                            "ID": id_val,
+                            "ID Type": id_col,
+                            "Found String": ls,
+                            "Matched Snippet": m["matched_snippet"],
+                            "Request URL": m.get("request_url", ""),
+                            "Response URL": m.get("response_url", m.get("source_file", "")),
+                            "Status": m.get("status_code", ""),
+                            "Mode": mode.upper()
+                        })
+                        # keep scanning for other ID types / other lookups,
+                        # but we don't need more rows for this same (placement, id_col, ls, match)
+                        # break only out of inner loop if you want uniqueness
+
+    matches_df = pd.DataFrame(matches_rows)
+
+    # Missing: placement × lookup where wide_matrix is False
+    missing_df = build_missing_df_by_placement_and_lookup(wide_matrix)
+
+    # Wide: placement-centric matrix
+    wide_rows = []
+    for pi, p in placements_df.iterrows():
+        placement_name = str(p["placement_name"])
+        pid_val = str(p.get(PRIMARY_ID_COL, "")).strip() if PRIMARY_ID_COL else ""
+        row = {"Placement Name": placement_name, "PID": pid_val}
+        for ls in lookup_strings_ordered:
+            row[ls] = "FOUND" if wide_matrix[(pi, ls)] else ""
+        wide_rows.append(row)
+    wide_df = pd.DataFrame(wide_rows)
+
+    return matches_df, missing_df, wide_df
+
+
+# ================================================================
+# RUN HAR
+# ================================================================
+print("\n=== RUNNING HAR SCAN ===")
+if os.path.exists(HAR_PATH):
+    har_raw_matches = scan_har_raw(HAR_PATH, lookups_df)
+    har_matches, har_missing, har_wide = build_placement_outputs(har_raw_matches, mode="HAR")
+    
+    har_status = pd.DataFrame([{
+        "Source File": HAR_PATH,
+        "Status": "HAR_SCANNED",
+        "Fetch Status": "",
+        "XML Status": ""
+    }])
+    
+    with pd.ExcelWriter(OUTPUT_HAR) as w:
+        har_matches.to_excel(w, "Matches", index=False)
+        har_missing.to_excel(w, "Missing", index=False)
+        har_wide.to_excel(w, "Wide", index=False)
+        har_status.to_excel(w, "Status", index=False)
+    
+    print(f"[HAR] DONE → {OUTPUT_HAR}")
+    print(f"[HAR] Matches: {len(har_matches)} | Missing rows: {len(har_missing)}")
+else:
+    print("[WARN] HAR file missing — skipping HAR scan.")
+# ================================================================
+# RUN VAST
+# ================================================================
+print("\n=== RUNNING VAST SCAN ===")
+vast_raw_matches, vast_status = scan_vast_raw(video_df, lookups_df)
+vast_matches, vast_missing, vast_wide = build_placement_outputs(vast_raw_matches, mode="VAST")
+
+with pd.ExcelWriter(OUTPUT_VAST) as w:
+    vast_matches.to_excel(w, "Matches", index=False)
+    vast_missing.to_excel(w, "Missing", index=False)
+    vast_wide.to_excel(w, "Wide", index=False)
+    vast_status.to_excel(w, "Status", index=False)
+
+print(f"[VAST] DONE → {OUTPUT_VAST}")
+print(f"[VAST] Matches: {len(vast_matches)} | Missing rows: {len(vast_missing)}")
